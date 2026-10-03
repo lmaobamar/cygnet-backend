@@ -96,7 +96,7 @@ func (h *Handler) signup(w http.ResponseWriter, r *http.Request) error {
 	if err := h.startSession(w, r, user.ID); err != nil {
 		return err
 	}
-	httpx.WriteJson(w, http.StatusCreated, user)
+	httpx.WriteJson(w, http.StatusCreated, users.SelfOf(user))
 	return nil
 }
 
@@ -124,7 +124,7 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) error {
 	if err := h.startSession(w, r, user.ID); err != nil {
 		return err
 	}
-	httpx.WriteJson(w, http.StatusOK, user)
+	httpx.WriteJson(w, http.StatusOK, users.SelfOf(user))
 	return nil
 }
 
@@ -164,7 +164,7 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) error {
 	case err != nil:
 		return err
 	}
-	httpx.WriteJson(w, http.StatusOK, user)
+	httpx.WriteJson(w, http.StatusOK, users.SelfOf(user))
 	return nil
 }
 
