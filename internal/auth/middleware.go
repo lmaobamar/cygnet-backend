@@ -2,25 +2,34 @@ package auth
 
 import (
 	"context"
+	"errors"
+	"log"
 	"net/http"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 
 	"github.com/lmaobamar/cygnet-backend/internal/httpx"
+	"github.com/lmaobamar/cygnet-backend/internal/session"
 )
 
-type ctxKey struct{}
+type sessionCtxKey struct{}
 
-// Lets other packages read who is logged in
+func SessionInfo(ctx context.Context) (*session.Info, bool) {
+	info, ok := ctx.Value(sessionCtxKey{}).(*session.Info)
+	return info, ok
+}
+
 func UserID(ctx context.Context) (uuid.UUID, bool) {
-	id, ok := ctx.Value(ctxKey{}).(uuid.UUID)
-	return id, ok
+	info, ok := SessionInfo(ctx)
+	if !ok {
+		return uuid.Nil, false
+	}
+	return info.UserID, true
 }
 
 func (h *Handler) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fail := func(msg string) {
+		unauthorized := func(msg string) {
 			httpx.WriteJson(w, http.StatusUnauthorized, httpx.ErrorResponse{
 				Code: httpx.UnauthorizedError, Message: msg,
 			})
@@ -28,22 +37,22 @@ func (h *Handler) RequireAuth(next http.Handler) http.Handler {
 
 		c, err := r.Cookie("session")
 		if err != nil {
-			fail("not logged in")
+			unauthorized("not logged in")
 			return
 		}
-		claims := &jwt.RegisteredClaims{}
-		tok, err := jwt.ParseWithClaims(c.Value, claims,
-			func(t *jwt.Token) (any, error) { return h.JWTSecret, nil },
-			jwt.WithValidMethods([]string{"HS256"}))
-		if err != nil || !tok.Valid {
-			fail("invalid session")
+		info, err := h.Sessions.Get(r.Context(), c.Value)
+		if errors.Is(err, session.ErrNotFound) {
+			clearCookie(w, r)
+			unauthorized("invalid session")
 			return
 		}
-		id, err := uuid.Parse(claims.Subject)
-		if err != nil {
-			fail("invalid session")
+		if err != nil { // Dragonfly problem: fail closed
+			log.Printf("session lookup failed: %v", err)
+			httpx.WriteJson(w, http.StatusInternalServerError, httpx.ErrorResponse{
+				Code: httpx.InternalError, Message: "something went wrong",
+			})
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, id)))
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), sessionCtxKey{}, info)))
 	})
 }

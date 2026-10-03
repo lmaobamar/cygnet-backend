@@ -5,31 +5,39 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/lmaobamar/cygnet-backend/internal/httpx"
+	"github.com/lmaobamar/cygnet-backend/internal/ratelimit"
+	"github.com/lmaobamar/cygnet-backend/internal/session"
 	"github.com/lmaobamar/cygnet-backend/internal/users"
 )
 
 type Handler struct {
-	Users     *users.Service
-	JWTSecret []byte
+	Users    *users.Service
+	Sessions *session.Store
+	Limiter  *ratelimit.Limiter
 }
 
-func New(u *users.Service, secret []byte) *Handler {
-	return &Handler{Users: u, JWTSecret: secret}
+func New(u *users.Service, s *session.Store, l *ratelimit.Limiter) *Handler {
+	return &Handler{Users: u, Sessions: s, Limiter: l}
 }
 
 func (h *Handler) Mount(r chi.Router) {
-	r.Post("/signup", httpx.Handle(h.signup))
-	r.Post("/login", httpx.Handle(h.login))
+	r.With(h.Limiter.Limit("signup", ratelimit.PerHour(10))).Post("/signup", httpx.Handle(h.signup))
+	r.With(h.Limiter.Limit("login", ratelimit.PerMinute(10))).Post("/login", httpx.Handle(h.login))
 	r.Post("/logout", httpx.Handle(h.logout))
 	r.Group(func(r chi.Router) {
 		r.Use(h.RequireAuth)
 		r.Get("/me", httpx.Handle(h.me))
+		r.Post("/logout-all", httpx.Handle(h.logoutAll))
+		r.Get("/sessions", httpx.Handle(h.listSessions))
+		r.Delete("/sessions/{id}", httpx.Handle(h.revokeSession))
 	})
 }
 
@@ -85,7 +93,7 @@ func (h *Handler) signup(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	if err := h.issueCookie(r, w, user.ID); err != nil {
+	if err := h.startSession(w, r, user.ID); err != nil {
 		return err
 	}
 	httpx.WriteJson(w, http.StatusCreated, user)
@@ -97,8 +105,15 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) error {
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		return httpx.NewError(http.StatusBadRequest, httpx.InvalidRequestError, "invalid request body")
 	}
+	email := strings.ToLower(strings.TrimSpace(in.Email))
 
-	user, err := h.Users.Authenticate(r.Context(), in.Email, in.Password)
+	// per account limit, so one account can't be hammered from many IPs
+	if ok, retry := h.Limiter.Check(r.Context(), "login_email", email, ratelimit.PerMinute(5)); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
+		return httpx.NewError(http.StatusTooManyRequests, httpx.RateLimitedError, "too many attempts, try again shortly")
+	}
+
+	user, err := h.Users.Authenticate(r.Context(), email, in.Password)
 	switch {
 	case errors.Is(err, users.ErrInvalidCredentials):
 		return httpx.NewError(http.StatusUnauthorized, httpx.InvalidCredentialsError, "invalid email or password")
@@ -106,7 +121,7 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	if err := h.issueCookie(r, w, user.ID); err != nil {
+	if err := h.startSession(w, r, user.ID); err != nil {
 		return err
 	}
 	httpx.WriteJson(w, http.StatusOK, user)
@@ -114,9 +129,25 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *Handler) logout(w http.ResponseWriter, r *http.Request) error {
-	http.SetCookie(w, &http.Cookie{
-		Name: "session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true,
-	})
+	if c, err := r.Cookie("session"); err == nil {
+		if err := h.Sessions.Delete(r.Context(), c.Value); err != nil {
+			return err
+		}
+	}
+	clearCookie(w, r)
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+func (h *Handler) logoutAll(w http.ResponseWriter, r *http.Request) error {
+	id, ok := UserID(r.Context())
+	if !ok {
+		return httpx.NewError(http.StatusUnauthorized, httpx.UnauthorizedError, "not logged in")
+	}
+	if err := h.Sessions.DeleteAll(r.Context(), id); err != nil {
+		return err
+	}
+	clearCookie(w, r)
 	w.WriteHeader(http.StatusNoContent)
 	return nil
 }
@@ -134,5 +165,44 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	httpx.WriteJson(w, http.StatusOK, user)
+	return nil
+}
+
+type sessionDTO struct {
+	ID        string    `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	LastSeen  time.Time `json:"last_seen"`
+	IP        string    `json:"ip"`
+	UserAgent string    `json:"user_agent"`
+	Current   bool      `json:"current"`
+}
+
+func (h *Handler) listSessions(w http.ResponseWriter, r *http.Request) error {
+	cur, _ := SessionInfo(r.Context())
+	list, err := h.Sessions.List(r.Context(), cur.UserID)
+	if err != nil {
+		return err
+	}
+	out := make([]sessionDTO, 0, len(list))
+	for _, s := range list {
+		out = append(out, sessionDTO{
+			ID: s.ID, CreatedAt: s.CreatedAt, LastSeen: s.LastSeen,
+			IP: s.IP, UserAgent: s.UserAgent, Current: s.ID == cur.ID,
+		})
+	}
+	httpx.WriteJson(w, http.StatusOK, out)
+	return nil
+}
+
+func (h *Handler) revokeSession(w http.ResponseWriter, r *http.Request) error {
+	cur, _ := SessionInfo(r.Context())
+	err := h.Sessions.DeleteByID(r.Context(), cur.UserID, chi.URLParam(r, "id"))
+	if errors.Is(err, session.ErrNotFound) {
+		return httpx.NewError(http.StatusNotFound, httpx.InvalidRequestError, "session not found")
+	}
+	if err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
 	return nil
 }

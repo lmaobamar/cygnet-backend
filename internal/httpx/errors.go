@@ -16,6 +16,8 @@ const (
 	EmailAlreadyInUseError  ErrorCode = "EmailAlreadyInUseError"
 	InvalidCredentialsError ErrorCode = "InvalidCredentialsError"
 	UnauthorizedError       ErrorCode = "UnauthorizedError"
+	ForbiddenError          ErrorCode = "ForbiddenError"
+	RateLimitedError        ErrorCode = "RateLimitedError"
 )
 
 type FieldError struct {

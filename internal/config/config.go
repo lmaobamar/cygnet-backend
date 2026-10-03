@@ -12,6 +12,7 @@ import (
 
 type Config struct {
 	DatabaseURL string
+	RedisURL    string
 	JWTSecret   string
 	Port        uint16
 }
