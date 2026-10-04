@@ -49,6 +49,12 @@ func Load(path ...string) Config {
 	if err := cfg.Storage.Validate(); err != nil {
 		panic(fmt.Sprintf("can't load StorageConfig: %v", err))
 	}
+	if cfg.Storage.Driver == string(DriverLocal) {
+		if err := os.MkdirAll(cfg.Storage.Local.BaseDir, 0755); err != nil {
+			panic(fmt.Sprintf("can't create %s: %v", cfg.Storage.Local.BaseDir, err))
+		}
+		log.Printf("made local storage dir")
+	}
 
 	log.Printf("cfg in %v", time.Since(loadStart))
 	return cfg
