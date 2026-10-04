@@ -14,6 +14,7 @@ type Config struct {
 	DatabaseURL string
 	RedisURL    string
 	Port        uint16
+	Storage     StorageConfig
 }
 
 var (
@@ -44,6 +45,9 @@ func Load(path ...string) Config {
 	}
 	if cfg.Port == 0 {
 		panic("Port is required")
+	}
+	if err := cfg.Storage.Validate(); err != nil {
+		panic(fmt.Sprintf("can't load StorageConfig: %v", err))
 	}
 
 	log.Printf("cfg in %v", time.Since(loadStart))

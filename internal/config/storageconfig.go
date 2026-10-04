@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 type DriverType string
 
 const (
@@ -24,4 +26,22 @@ type StorageConfig struct {
 	Driver string
 	S3     S3Config
 	Local  LocalStorageConfig
+}
+
+func (s StorageConfig) Validate() error {
+	switch s.Driver {
+	case string(DriverS3):
+		if s.S3.Bucket == "" || s.S3.AccessKeyID == "" || s.S3.SecretAccessKey == "" {
+			return fmt.Errorf("DriverS3 requires Bucket, AccessKeyID, and SecretAccessKey")
+		}
+	case string(DriverLocal):
+		if s.Local.BaseDir == "" {
+			return fmt.Errorf("DriverLocal requires non-empty BaseDir")
+		}
+	case "":
+		return fmt.Errorf("Storage: a Driver is required")
+	default:
+		return fmt.Errorf("Invalid Storage driver")
+	}
+	return nil
 }
