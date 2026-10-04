@@ -16,6 +16,7 @@ type S3Config struct {
 	SecretAccessKey string
 	Endpoint        string `json:",omitempty"`
 	UsePathStyle    bool   `json:",omitempty"`
+	BaseURL         string
 }
 
 type LocalStorageConfig struct {
@@ -33,6 +34,9 @@ func (s StorageConfig) Validate() error {
 	case string(DriverS3):
 		if s.S3.Bucket == "" || s.S3.AccessKeyID == "" || s.S3.SecretAccessKey == "" {
 			return fmt.Errorf("DriverS3 requires Bucket, AccessKeyID, and SecretAccessKey")
+		}
+		if s.S3.BaseURL == "" {
+			return fmt.Errorf("DriverS3 requires BaseURL. For example https://cdn.example.com")
 		}
 	case string(DriverLocal):
 		if s.Local.BaseDir == "" {
