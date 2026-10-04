@@ -19,13 +19,4 @@ type User struct {
 	CreatedAt    time.Time `json:"-"`
 }
 
-func (u *User) BeforeCreate(tx *gorm.DB) error {
-	if u.ID == uuid.Nil {
-		id, err := uuid.NewV7()
-		if err != nil {
-			return err
-		}
-		u.ID = id
-	}
-	return nil
-}
+func (u *User) BeforeCreate(tx *gorm.DB) error { return newID(&u.ID) }
