@@ -1,0 +1,11 @@
+{
+	"DatabaseURL": "postgres://postgres:postgres@localhost:5432/cygnet",
+	"RedisURL": "127.0.0.1:6379",
+	"Port": 8080,
+	"Storage": {
+		"Driver": "local",
+		"Local": {
+			"BaseDir": ".storage"
+		}
+	}
+}
