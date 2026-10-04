@@ -1,16 +1,14 @@
 package auth
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/danielgtaylor/huma/v2"
 
 	"github.com/lmaobamar/cygnet-backend/internal/httpx"
 	"github.com/lmaobamar/cygnet-backend/internal/ratelimit"
@@ -28,144 +26,147 @@ func New(u *users.Service, s *session.Store, l *ratelimit.Limiter) *Handler {
 	return &Handler{Users: u, Sessions: s, Limiter: l}
 }
 
-func (h *Handler) Mount(r chi.Router) {
-	r.With(h.Limiter.Limit("signup", ratelimit.PerHour(10))).Post("/signup", httpx.Handle(h.signup))
-	r.With(h.Limiter.Limit("login", ratelimit.PerMinute(10))).Post("/login", httpx.Handle(h.login))
-	r.Post("/logout", httpx.Handle(h.logout))
-	r.Group(func(r chi.Router) {
-		r.Use(h.RequireAuth)
-		r.Get("/me", httpx.Handle(h.me))
-		r.Post("/logout-all", httpx.Handle(h.logoutAll))
-		r.Get("/sessions", httpx.Handle(h.listSessions))
-		r.Delete("/sessions/{id}", httpx.Handle(h.revokeSession))
-	})
+func (h *Handler) Register(api huma.API) {
+	tags := []string{"auth"}
+	protected := huma.Middlewares{h.RequireAuth(api)}
+
+	// public
+	huma.Register(api, huma.Operation{OperationID: "signup", Method: http.MethodPost, Path: "/api/signup", Tags: tags, DefaultStatus: http.StatusCreated}, h.signup)
+	huma.Register(api, huma.Operation{OperationID: "login", Method: http.MethodPost, Path: "/api/login", Tags: tags}, h.login)
+	huma.Register(api, huma.Operation{OperationID: "logout", Method: http.MethodPost, Path: "/api/logout", Tags: tags, DefaultStatus: http.StatusNoContent}, h.logout)
+
+	// protected
+	huma.Register(api, huma.Operation{OperationID: "me", Method: http.MethodGet, Path: "/api/me", Tags: tags, Middlewares: protected, Security: Secured}, h.me)
+	huma.Register(api, huma.Operation{OperationID: "logout-all", Method: http.MethodPost, Path: "/api/logout-all", Tags: tags, DefaultStatus: http.StatusNoContent, Middlewares: protected, Security: Secured}, h.logoutAll)
+	huma.Register(api, huma.Operation{OperationID: "list-sessions", Method: http.MethodGet, Path: "/api/sessions", Tags: tags, Middlewares: protected, Security: Secured}, h.listSessions)
+	huma.Register(api, huma.Operation{OperationID: "revoke-session", Method: http.MethodDelete, Path: "/api/sessions/{id}", Tags: tags, DefaultStatus: http.StatusNoContent, Middlewares: protected, Security: Secured}, h.revokeSession)
 }
 
-var handleRe = regexp.MustCompile(`^[a-z0-9_]{3,32}$`)
-
-type signupRequest struct {
-	Handle      string `json:"handle"`
-	DisplayName string `json:"display_name"` // optional
-	Email       string `json:"email"`
-	Password    string `json:"password"`
+func tooMany(retry time.Duration) error {
+	return httpx.NewProblem(http.StatusTooManyRequests, httpx.RateLimitedError,
+		fmt.Sprintf("too many requests, try again in %d seconds", int(retry.Seconds())+1))
 }
 
-type loginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+type signupIn struct {
+	UserAgent string `header:"User-Agent"`
+	Session   string `cookie:"session"`
+	Body      struct {
+		Handle      string `json:"handle" minLength:"3" maxLength:"32" pattern:"^[a-z0-9_]+$" doc:"lowercase letters, digits and underscore"`
+		DisplayName string `json:"display_name,omitempty" maxLength:"50" doc:"optional; defaults to the handle"`
+		Email       string `json:"email" format:"email" maxLength:"255"`
+		Password    string `json:"password" minLength:"8" maxLength:"72" doc:"72 is bcrypt's limit"`
+	}
 }
 
-func (h *Handler) signup(w http.ResponseWriter, r *http.Request) error {
-	var in signupRequest
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		return httpx.NewError(http.StatusBadRequest, httpx.InvalidRequestError, "invalid request body")
-	}
-	in.Handle = strings.ToLower(strings.TrimSpace(in.Handle))
-	in.DisplayName = strings.TrimSpace(in.DisplayName)
-	in.Email = strings.ToLower(strings.TrimSpace(in.Email))
+type sessionOut struct {
+	SetCookie http.Cookie `header:"Set-Cookie"`
+	Body      users.SelfUser
+}
 
-	var fields []httpx.FieldError
-	if !handleRe.MatchString(in.Handle) {
-		fields = append(fields, httpx.FieldError{Field: "handle", Message: "3-32 characters: a-z, 0-9 and _"})
-	}
-	if utf8.RuneCountInString(in.DisplayName) > 50 {
-		fields = append(fields, httpx.FieldError{Field: "display_name", Message: "must be 50 characters or fewer"})
-	}
-	if in.Email == "" {
-		fields = append(fields, httpx.FieldError{Field: "email", Message: "required"})
-	}
-	if len(in.Password) < 8 {
-		fields = append(fields, httpx.FieldError{Field: "password", Message: "must be at least 8 characters"})
-	}
-	if len(fields) > 0 {
-		return httpx.NewError(http.StatusUnprocessableEntity, httpx.ValidationFailedError, "some fields are invalid", fields...)
+func (h *Handler) signup(ctx context.Context, in *signupIn) (*sessionOut, error) {
+	if ok, retry := h.Limiter.Check(ctx, "signup", httpx.MetaFrom(ctx).IP, ratelimit.PerHour(10)); !ok {
+		return nil, tooMany(retry)
 	}
 
-	user, err := h.Users.Create(r.Context(), in.Handle, in.DisplayName, in.Email, in.Password)
+	user, err := h.Users.Create(ctx, in.Body.Handle, strings.TrimSpace(in.Body.DisplayName),
+		strings.ToLower(strings.TrimSpace(in.Body.Email)), in.Body.Password)
 	switch {
 	case errors.Is(err, users.ErrHandleTaken):
-		return httpx.NewError(http.StatusConflict, httpx.HandleTakenError, "handle taken",
+		return nil, httpx.NewProblem(http.StatusConflict, httpx.HandleTakenError, "handle taken",
 			httpx.FieldError{Field: "handle", Message: "taken"})
 	case errors.Is(err, users.ErrEmailTaken):
-		return httpx.NewError(http.StatusConflict, httpx.EmailAlreadyInUseError, "email already in use",
+		return nil, httpx.NewProblem(http.StatusConflict, httpx.EmailAlreadyInUseError, "email already in use",
 			httpx.FieldError{Field: "email", Message: "already in use"})
 	case err != nil:
-		return err
+		return nil, err
 	}
 
-	if err := h.startSession(w, r, user.ID); err != nil {
-		return err
+	cookie, err := h.sessionCookie(ctx, user.ID, in.Session, in.UserAgent)
+	if err != nil {
+		return nil, err
 	}
-	httpx.WriteJson(w, http.StatusCreated, users.SelfOf(user))
-	return nil
+	return &sessionOut{SetCookie: cookie, Body: users.SelfOf(user)}, nil
 }
 
-func (h *Handler) login(w http.ResponseWriter, r *http.Request) error {
-	var in loginRequest
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		return httpx.NewError(http.StatusBadRequest, httpx.InvalidRequestError, "invalid request body")
+type loginIn struct {
+	UserAgent string `header:"User-Agent"`
+	Session   string `cookie:"session"`
+	Body      struct {
+		HandleOrEmail string `json:"handle_or_email"`
+		Password      string `json:"password" minLength:"1" maxLength:"72"`
 	}
-	email := strings.ToLower(strings.TrimSpace(in.Email))
+}
 
-	// per account limit, so one account can't be hammered from many IPs
-	if ok, retry := h.Limiter.Check(r.Context(), "login_email", email, ratelimit.PerMinute(5)); !ok {
-		w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
-		return httpx.NewError(http.StatusTooManyRequests, httpx.RateLimitedError, "too many attempts, try again shortly")
+func (h *Handler) login(ctx context.Context, in *loginIn) (*sessionOut, error) {
+	handleOrEmail := strings.ToLower(strings.TrimSpace(in.Body.HandleOrEmail))
+
+	if ok, retry := h.Limiter.Check(ctx, "login", httpx.MetaFrom(ctx).IP, ratelimit.PerMinute(10)); !ok {
+		return nil, tooMany(retry)
+	}
+	if ok, retry := h.Limiter.Check(ctx, "login_email", handleOrEmail, ratelimit.PerMinute(5)); !ok {
+		return nil, tooMany(retry)
 	}
 
-	user, err := h.Users.Authenticate(r.Context(), email, in.Password)
+	user, err := h.Users.Authenticate(ctx, handleOrEmail, in.Body.Password)
 	switch {
 	case errors.Is(err, users.ErrInvalidCredentials):
-		return httpx.NewError(http.StatusUnauthorized, httpx.InvalidCredentialsError, "invalid email or password")
+		return nil, httpx.NewProblem(http.StatusUnauthorized, httpx.InvalidCredentialsError, "invalid email or password")
 	case err != nil:
-		return err
+		return nil, err
 	}
 
-	if err := h.startSession(w, r, user.ID); err != nil {
-		return err
+	cookie, err := h.sessionCookie(ctx, user.ID, in.Session, in.UserAgent)
+	if err != nil {
+		return nil, err
 	}
-	httpx.WriteJson(w, http.StatusOK, users.SelfOf(user))
-	return nil
+	return &sessionOut{SetCookie: cookie, Body: users.SelfOf(user)}, nil
 }
 
-func (h *Handler) logout(w http.ResponseWriter, r *http.Request) error {
-	if c, err := r.Cookie("session"); err == nil {
-		if err := h.Sessions.Delete(r.Context(), c.Value); err != nil {
-			return err
+type cookieIn struct {
+	Session string `cookie:"session"`
+}
+
+type clearCookieOut struct {
+	SetCookie http.Cookie `header:"Set-Cookie"`
+}
+
+func (h *Handler) logout(ctx context.Context, in *cookieIn) (*clearCookieOut, error) {
+	if in.Session != "" {
+		if err := h.Sessions.Delete(ctx, in.Session); err != nil {
+			return nil, err
 		}
 	}
-	clearCookie(w, r)
-	w.WriteHeader(http.StatusNoContent)
-	return nil
+	return &clearCookieOut{SetCookie: expiredCookie(ctx)}, nil
 }
 
-func (h *Handler) logoutAll(w http.ResponseWriter, r *http.Request) error {
-	id, ok := UserID(r.Context())
-	if !ok {
-		return httpx.NewError(http.StatusUnauthorized, httpx.UnauthorizedError, "not logged in")
+// needs auth below:
+
+func (h *Handler) logoutAll(ctx context.Context, _ *struct{}) (*clearCookieOut, error) {
+	info, err := SessionFrom(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if err := h.Sessions.DeleteAll(r.Context(), id); err != nil {
-		return err
+	if err := h.Sessions.DeleteAll(ctx, info.UserID); err != nil {
+		return nil, err
 	}
-	clearCookie(w, r)
-	w.WriteHeader(http.StatusNoContent)
-	return nil
+	return &clearCookieOut{SetCookie: expiredCookie(ctx)}, nil
 }
 
-func (h *Handler) me(w http.ResponseWriter, r *http.Request) error {
-	id, ok := UserID(r.Context())
-	if !ok {
-		return httpx.NewError(http.StatusUnauthorized, httpx.UnauthorizedError, "not logged in")
+type meOut struct{ Body users.SelfUser }
+
+func (h *Handler) me(ctx context.Context, _ *struct{}) (*meOut, error) {
+	info, err := SessionFrom(ctx)
+	if err != nil {
+		return nil, err
 	}
-	user, err := h.Users.ByID(r.Context(), id)
+	user, err := h.Users.ByID(ctx, info.UserID)
 	switch {
 	case errors.Is(err, users.ErrNotFound):
-		return httpx.NewError(http.StatusUnauthorized, httpx.UnauthorizedError, "invalid session")
+		return nil, httpx.NewProblem(http.StatusUnauthorized, httpx.UnauthorizedError, "invalid session")
 	case err != nil:
-		return err
+		return nil, err
 	}
-	httpx.WriteJson(w, http.StatusOK, users.SelfOf(user))
-	return nil
+	return &meOut{Body: users.SelfOf(user)}, nil
 }
 
 type sessionDTO struct {
@@ -177,11 +178,16 @@ type sessionDTO struct {
 	Current   bool      `json:"current"`
 }
 
-func (h *Handler) listSessions(w http.ResponseWriter, r *http.Request) error {
-	cur, _ := SessionInfo(r.Context())
-	list, err := h.Sessions.List(r.Context(), cur.UserID)
+type sessionsOut struct{ Body []sessionDTO }
+
+func (h *Handler) listSessions(ctx context.Context, _ *struct{}) (*sessionsOut, error) {
+	cur, err := SessionFrom(ctx)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	list, err := h.Sessions.List(ctx, cur.UserID)
+	if err != nil {
+		return nil, err
 	}
 	out := make([]sessionDTO, 0, len(list))
 	for _, s := range list {
@@ -190,19 +196,24 @@ func (h *Handler) listSessions(w http.ResponseWriter, r *http.Request) error {
 			IP: s.IP, UserAgent: s.UserAgent, Current: s.ID == cur.ID,
 		})
 	}
-	httpx.WriteJson(w, http.StatusOK, out)
-	return nil
+	return &sessionsOut{Body: out}, nil
 }
 
-func (h *Handler) revokeSession(w http.ResponseWriter, r *http.Request) error {
-	cur, _ := SessionInfo(r.Context())
-	err := h.Sessions.DeleteByID(r.Context(), cur.UserID, chi.URLParam(r, "id"))
+type revokeIn struct {
+	ID string `path:"id"`
+}
+
+func (h *Handler) revokeSession(ctx context.Context, in *revokeIn) (*struct{}, error) {
+	cur, err := SessionFrom(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = h.Sessions.DeleteByID(ctx, cur.UserID, in.ID)
 	if errors.Is(err, session.ErrNotFound) {
-		return httpx.NewError(http.StatusNotFound, httpx.InvalidRequestError, "session not found")
+		return nil, httpx.NewProblem(http.StatusNotFound, httpx.InvalidRequestError, "session not found")
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
-	w.WriteHeader(http.StatusNoContent)
-	return nil
+	return nil, nil
 }

@@ -16,11 +16,12 @@ func Connect(dsn string) *gorm.DB {
 	if err != nil {
 		log.Fatalf("db: cant connect: %v", err)
 	}
+	log.Printf("db in %v", time.Since(loadStart))
 	if err := db.AutoMigrate(&models.User{}); err != nil {
 		log.Fatalf("db: migrate failed : %v", err)
+	} else {
+		log.Printf("db.AutoMigrate in %v", time.Since(loadStart))
 	}
 
-	since := time.Since(loadStart)
-	log.Printf("db in %v", since)
 	return db
 }

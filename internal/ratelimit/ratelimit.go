@@ -29,13 +29,10 @@ type Limiter struct{ rdb *redis.Client }
 
 func New(rdb *redis.Client) *Limiter { return &Limiter{rdb: rdb} }
 
-// Check counts one request in bucket/key. Fails open if Redis is unavailable.
-// The key is hashed so emails and other identifiers never sit in Redis in plain text.
 func (l *Limiter) Check(ctx context.Context, bucket, key string, limit Limit) (bool, time.Duration) {
 	sum := sha256.Sum256([]byte(key))
 	redisKey := fmt.Sprintf("rl:%s:%s", bucket, hex.EncodeToString(sum[:8]))
 
-	// TxPipeline runs these as one atomic block, so a key can never exist without an expiry
 	pipe := l.rdb.TxPipeline()
 	pipe.SetNX(ctx, redisKey, 0, limit.Window) // starts the window only if one isn't running
 	count := pipe.Incr(ctx, redisKey)
@@ -55,7 +52,6 @@ func (l *Limiter) Check(ctx context.Context, bucket, key string, limit Limit) (b
 	return true, 0
 }
 
-// Limit is middleware limiting each client IP to `limit` in the named bucket.
 func (l *Limiter) Limit(bucket string, limit Limit) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -68,11 +68,11 @@ func (s *Service) whichConflict(ctx context.Context, handle string) error {
 	return ErrEmailTaken
 }
 
-func (s *Service) Authenticate(ctx context.Context, email, password string) (*models.User, error) {
-	email = strings.ToLower(strings.TrimSpace(email))
+func (s *Service) Authenticate(ctx context.Context, identifier, password string) (*models.User, error) {
+	identifier = strings.ToLower(strings.TrimSpace(identifier))
 
 	var user models.User
-	err := s.db.WithContext(ctx).Where("email = ?", email).First(&user).Error
+	err := s.db.WithContext(ctx).Where("handle = ? OR email = ?", identifier, identifier).First(&user).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, ErrInvalidCredentials
 	}

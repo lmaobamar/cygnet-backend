@@ -3,56 +3,58 @@ package auth
 import (
 	"context"
 	"errors"
-	"log"
 	"net/http"
 
-	"github.com/google/uuid"
+	"github.com/danielgtaylor/huma/v2"
 
 	"github.com/lmaobamar/cygnet-backend/internal/httpx"
 	"github.com/lmaobamar/cygnet-backend/internal/session"
 )
 
-type sessionCtxKey struct{}
+const schemeName = "session"
 
-func SessionInfo(ctx context.Context) (*session.Info, bool) {
-	info, ok := ctx.Value(sessionCtxKey{}).(*session.Info)
-	return info, ok
+var SecuritySchemes = map[string]*huma.SecurityScheme{
+	schemeName: {Type: "apiKey", In: "cookie", Name: "session"},
 }
 
-func UserID(ctx context.Context) (uuid.UUID, bool) {
-	info, ok := SessionInfo(ctx)
-	if !ok {
-		return uuid.Nil, false
-	}
-	return info.UserID, true
-}
+var Secured = []map[string][]string{{schemeName: {}}}
 
-func (h *Handler) RequireAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		unauthorized := func(msg string) {
-			httpx.WriteJson(w, http.StatusUnauthorized, httpx.ErrorResponse{
-				Code: httpx.UnauthorizedError, Message: msg,
-			})
-		}
+type sessionKey struct{}
 
-		c, err := r.Cookie("session")
-		if err != nil {
-			unauthorized("not logged in")
+// RequireAuth is Huma operation middleware, attach it to any operation that needs a login:
+//
+//	middlewares: huma.Middlewares{authH.RequireAuth(api)},
+//	security:    auth.Secured,
+func (h *Handler) RequireAuth(api huma.API) func(huma.Context, func(huma.Context)) {
+	return func(ctx huma.Context, next func(huma.Context)) {
+		cookie, err := huma.ReadCookie(ctx, "session")
+		if err != nil || cookie.Value == "" {
+			huma.WriteErr(api, ctx, http.StatusUnauthorized, "not logged in")
 			return
 		}
-		info, err := h.Sessions.Get(r.Context(), c.Value)
+
+		info, err := h.Sessions.Get(ctx.Context(), cookie.Value)
 		if errors.Is(err, session.ErrNotFound) {
-			clearCookie(w, r)
-			unauthorized("invalid session")
+			expired := expiredCookie(ctx.Context()) // tell the browser to drop the dead cookie
+			ctx.AppendHeader("Set-Cookie", expired.String())
+			huma.WriteErr(api, ctx, http.StatusUnauthorized, "invalid session")
 			return
 		}
-		if err != nil { // Dragonfly problem: fail closed
-			log.Printf("session lookup failed: %v", err)
-			httpx.WriteJson(w, http.StatusInternalServerError, httpx.ErrorResponse{
-				Code: httpx.InternalError, Message: "something went wrong",
-			})
+		if err != nil { // Redis problem: fail closed
+			huma.WriteErr(api, ctx, http.StatusInternalServerError, "something went wrong", err)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), sessionCtxKey{}, info)))
-	})
+
+		next(huma.WithValue(ctx, sessionKey{}, info))
+	}
+}
+
+// SessionFrom reads the session that RequireAuth stored, handlers call this first.
+// if the middleware wasn't attached, it returns a 401, so forgetting it fails closed
+func SessionFrom(ctx context.Context) (*session.Info, error) {
+	info, ok := ctx.Value(sessionKey{}).(*session.Info)
+	if !ok || info == nil {
+		return nil, httpx.NewProblem(http.StatusUnauthorized, httpx.UnauthorizedError, "not logged in")
+	}
+	return info, nil
 }

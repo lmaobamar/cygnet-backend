@@ -1,41 +1,36 @@
 package auth
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
-	"github.com/tomasen/realip"
+
+	"github.com/lmaobamar/cygnet-backend/internal/httpx"
 )
 
-const cookieMaxAge = 400 * 24 * 3600
+const cookieMaxAge = 400 * 24 * time.Hour
 
-func isHTTPS(r *http.Request) bool {
-	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
-}
-
-func (h *Handler) startSession(w http.ResponseWriter, r *http.Request, userID uuid.UUID) error {
-	if old, err := r.Cookie("session"); err == nil {
-		_ = h.Sessions.Delete(r.Context(), old.Value)
+func (h *Handler) sessionCookie(ctx context.Context, userID uuid.UUID, oldToken, userAgent string) (http.Cookie, error) {
+	if oldToken != "" {
+		_ = h.Sessions.Delete(ctx, oldToken)
 	}
-	token, err := h.Sessions.Create(r.Context(), userID, realip.FromRequest(r), r.UserAgent())
+	meta := httpx.MetaFrom(ctx)
+	token, err := h.Sessions.Create(ctx, userID, meta.IP, userAgent)
 	if err != nil {
-		return err
+		return http.Cookie{}, err
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     "session",
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   isHTTPS(r),
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   cookieMaxAge,
-	})
-	return nil
+	return http.Cookie{
+		Name: "session", Value: token, Path: "/",
+		HttpOnly: true, Secure: meta.HTTPS, SameSite: http.SameSiteLaxMode,
+		MaxAge: int(cookieMaxAge.Seconds()),
+	}, nil
 }
 
-func clearCookie(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{
+func expiredCookie(ctx context.Context) http.Cookie {
+	return http.Cookie{
 		Name: "session", Value: "", Path: "/", MaxAge: -1,
-		HttpOnly: true, Secure: isHTTPS(r), SameSite: http.SameSiteLaxMode,
-	})
+		HttpOnly: true, Secure: httpx.MetaFrom(ctx).HTTPS, SameSite: http.SameSiteLaxMode,
+	}
 }

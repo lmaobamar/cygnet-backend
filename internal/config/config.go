@@ -13,7 +13,6 @@ import (
 type Config struct {
 	DatabaseURL string
 	RedisURL    string
-	JWTSecret   string
 	Port        uint16
 }
 
@@ -42,9 +41,6 @@ func Load(path ...string) Config {
 
 	if cfg.DatabaseURL == "" {
 		panic("DatabaseURL unset")
-	}
-	if len(cfg.JWTSecret) < 32 {
-		panic("JWTSecret must be at least 32 characters")
 	}
 	if cfg.Port == 0 {
 		panic("Port is required")
